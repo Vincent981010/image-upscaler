@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>SharpUp 圖片降噪放大</title>
+<script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.23.2/dist/ort.all.min.js"></script>
+<style>
+:root{--bg:#fafafa;--fg:#1c1c1e;--card:#fff;--bd:#d8d8dc;--ac:#6b4fd8;--mu:#6e6e73;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#17171a;--fg:#ececf0;--card:#222226;--bd:#3a3a40;--ac:#9b86f5;--mu:#9a9aa3}}
+:root[data-theme="dark"]{--bg:#17171a;--fg:#ececf0;--card:#222226;--bd:#3a3a40;--ac:#9b86f5;--mu:#9a9aa3}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 system-ui,-apple-system,"Noto Sans TC",sans-serif}
+main{max-width:760px;margin:0 auto;padding:20px 16px 40px}
+h1{font-size:24px;margin:0 0 4px}
+p.s{color:var(--mu);margin:0 0 16px}
+.card{background:var(--card);border:1px solid var(--bd);border-radius:12px;padding:16px;margin-bottom:14px}
+#drop{border:2px dashed var(--bd);border-radius:12px;padding:28px 12px;text-align:center;color:var(--mu);cursor:pointer}
+#drop.on{border-color:var(--ac);color:var(--ac)}
+.row{margin:12px 0 0}.row b{display:block;margin-bottom:6px}
+.opts{display:flex;flex-wrap:wrap;gap:6px}
+.opts label{border:1px solid var(--bd);border-radius:8px;padding:6px 12px;cursor:pointer}
+.opts input{display:none}
+.opts label:has(input:checked){background:var(--ac);border-color:var(--ac);color:#fff}
+button{background:var(--ac);color:#fff;border:0;border-radius:10px;padding:11px 20px;font-size:16px;cursor:pointer}
+button:disabled{opacity:.5}button.g{background:transparent;color:var(--ac);border:1px solid var(--ac)}
+progress{width:100%;height:8px;margin-top:10px;display:none}
+.cmp{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.cmp div{overflow:auto;max-height:340px;border:1px solid var(--bd);border-radius:8px;background:repeating-conic-gradient(#8883 0 25%,#0000 0 50%) 0 0/16px 16px}
+.cmp img{display:block;max-width:none}.cmp small{display:block;color:var(--mu);margin-bottom:4px}
+@media(max-width:560px){.cmp{grid-template-columns:1fr}}
+#info,#status{color:var(--mu);font-size:13px;margin-top:8px}
+</style>
+</head>
+<body>
+<main>
+<h1>SharpUp 圖片降噪放大</h1>
+<p class="s">使用 AI 模型在瀏覽器本機運算，圖片不會上傳。</p>
+<div class="card">
+  <div id="drop">拖曳圖片到這裡，或點擊選擇檔案</div>
+  <input type="file" id="file" accept="image/*" hidden>
+  <div id="info"></div>
+  <div class="row"><b>風格</b><div class="opts">
+    <label><input type="radio" name="style" value="swin_unet/art" checked>插畫</label>
+    <label><input type="radio" name="style" value="swin_unet/art_scan">插畫（掃描）</label>
+    <label><input type="radio" name="style" value="swin_unet/photo">照片</label>
+    <label><input type="radio" name="style" value="cunet/art">插畫（輕量快速）</label></div></div>
+  <div class="row"><b>降噪（有 JPEG 雜訊時才使用）</b><div class="opts">
+    <label><input type="radio" name="noise" value="-1" checked>無</label>
+    <label><input type="radio" name="noise" value="0">低</label>
+    <label><input type="radio" name="noise" value="1">中</label>
+    <label><input type="radio" name="noise" value="2">高</label>
+    <label><input type="radio" name="noise" value="3">最高</label></div></div>
+  <div class="row"><b>放大倍率</b><div class="opts">
+    <label><input type="radio" name="scale" value="1">不放大</label>
+    <label><input type="radio" name="scale" value="1.6">1.6x</label>
+    <label><input type="radio" name="scale" value="2" checked>2x</label>
+    <label><input type="radio" name="scale" value="4">4x</label></div></div>
+  <div class="row"><b>輸出格式</b><div class="opts">
+    <label><input type="radio" name="fmt" value="image/png" checked>PNG</label>
+    <label><input type="radio" name="fmt" value="image/webp">WebP</label></div></div>
+  <div class="row"><button id="go" disabled>開始轉換</button> <button class="g" id="dl" style="display:none">下載結果</button></div>
+  <progress id="pg" value="0" max="1"></progress>
+  <div id="status"></div>
+</div>
+<div class="card" id="result" style="display:none"><div class="cmp">
+  <div><small>原圖</small><img id="o"></div><div><small>結果</small><img id="r"></div></div></div>
+</main>
+<script>
+const MODEL_BASE="onnx_models/", T=128;
+const $=id=>document.getElementById(id), val=n=>document.querySelector(`input[name=${n}]:checked`).value, tick=()=>new Promise(r=>setTimeout(r,0));
+ort.env.wasm.wasmPaths="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.23.2/dist/";
+ort.env.wasm.numThreads=Math.min(4,navigator.hardwareConcurrency||1);
+let img=null,name="image",outURL=null,cache={path:null,sess:null};
+
+const drop=$("drop"),file=$("file");
+drop.onclick=()=>file.click();
+file.onchange=()=>load(file.files[0]);
+["dragover","dragenter"].forEach(e=>drop.addEventListener(e,ev=>{ev.preventDefault();drop.classList.add("on")}));
+["dragleave","drop"].forEach(e=>drop.addEventListener(e,ev=>{ev.preventDefault();drop.classList.remove("on")}));
+drop.addEventListener("drop",ev=>load(ev.dataTransfer.files[0]));
+function load(f){
+  if(!f||!f.type.startsWith("image/"))return;
+  name=f.name.replace(/\.[^.]+$/,"");
+  const u=URL.createObjectURL(f),im=new Image();
+  im.onload=()=>{img=im;$("go").disabled=false;$("info").textContent=`${f.name}　${im.naturalWidth}×${im.naturalHeight}px`;
+    $("o").src=u;$("result").style.display="block";$("r").removeAttribute("src");$("dl").style.display="none";$("status").textContent=""};
+  im.src=u;
+}
+
+function toCanvas(src,w,h){
+  const c=document.createElement("canvas");c.width=w;c.height=h;
+  const x=c.getContext("2d");x.imageSmoothingEnabled=true;x.imageSmoothingQuality="high";x.drawImage(src,0,0,w,h);return c;
+}
+const mir=(v,n)=>{if(n===1)return 0;const p=2*n-2;v=((v%p)+p)%p;return v<n?v:p-v};
+
+async function getSession(path){
+  if(cache.path===path)return cache.sess;
+  cache.sess=null;
+  let last;
+  for(const ep of ["webgpu","wasm"]){
+    try{const s=await ort.InferenceSession.create(path,{executionProviders:[ep]});cache={path,sess:s};return s}
+    catch(e){last=e}
+  }
+  throw new Error(`無法載入模型 ${path}：${last&&last.message||last}`);
+}
+
+// Run one model pass over a canvas; returns a new canvas scaled by s
+async function runPass(src,path,s,label){
+  const st=$("status"),pg=$("pg");
+  st.textContent=`${label}：載入模型…`;await tick();
+  const sess=await getSession(path);
+  const W=src.width,H=src.height,sd=src.getContext("2d").getImageData(0,0,W,H).data;
+  const inN=sess.inputNames[0],outN=sess.outputNames[0],buf=new Float32Array(3*T*T);
+  const gather=(x0,y0,off)=>{
+    for(let j=0;j<T;j++){const sy=mir(y0-off+j,H);
+      for(let i=0;i<T;i++){const sx=mir(x0-off+i,W),k=(sy*W+sx)*4,p=j*T+i;
+        buf[p]=sd[k]/255;buf[T*T+p]=sd[k+1]/255;buf[2*T*T+p]=sd[k+2]/255}}
+    return new ort.Tensor("float32",buf,[1,3,T,T]);
+  };
+  // probe output size to derive the model's border offset
+  const pr=(await sess.run({[inN]:gather(0,0,0)}))[outN];
+  const O=pr.dims[3],off=(T-O/s)/2;
+  if(!Number.isInteger(off)||off<0)throw new Error("無法判斷模型輸出尺寸");
+  const S=T-2*off,OW=W*s,OH=H*s,out=new ImageData(OW,OH),od=out.data,OO=O*O;
+  const nx=Math.ceil(W/S),ny=Math.ceil(H/S);let n=0;
+  pg.style.display="block";pg.max=nx*ny;
+  for(let ty=0;ty<ny;ty++)for(let tx=0;tx<nx;tx++){
+    const x0=tx*S,y0=ty*S;
+    const o=(await sess.run({[inN]:gather(x0,y0,off)}))[outN],d=o.data;
+    const w=Math.min(S,W-x0)*s,h=Math.min(S,H-y0)*s;
+    for(let j=0;j<h;j++)for(let i=0;i<w;i++){
+      const q=j*O+i,k=((y0*s+j)*OW+x0*s+i)*4;
+      od[k]=d[q]*255;od[k+1]=d[OO+q]*255;od[k+2]=d[2*OO+q]*255;
+    }
+    pg.value=++n;st.textContent=`${label}：${n}/${nx*ny}`;await tick();
+  }
+  // alpha channel via plain resize
+  const ad=toCanvas(src,OW,OH).getContext("2d").getImageData(0,0,OW,OH).data;
+  for(let k=3;k<od.length;k+=4)od[k]=ad[k];
+  const c=document.createElement("canvas");c.width=OW;c.height=OH;c.getContext("2d").putImageData(out,0,0);
+  return c;
+}
+
+$("go").onclick=async()=>{
+  if(!img)return;
+  const style=val("style"),noise=+val("noise"),scale=+val("scale"),st=$("status");
+  $("go").disabled=true;$("dl").style.display="none";
+  try{
+    const W=img.naturalWidth,H=img.naturalHeight;
+    let c=toCanvas(img,W,H);
+    // build list of passes: [file, factor]
+    const passes=[],nz=noise>=0?`noise${noise}`:null;
+    const f=(n,k)=>`${MODEL_BASE}${style}/${n}.onnx`;
+    if(scale===1){ if(nz)passes.push([f(nz),1]); }
+    else if(scale===4&&style.startsWith("cunet")){
+      passes.push([f(nz?`${nz}_scale2x`:"scale2x"),2],[f("scale2x"),2]);
+    }else{
+      const k=scale===4?4:2;
+      passes.push([f(nz?`${nz}_scale${k}x`:`scale${k}x`),k]);
+    }
+    if(!passes.length){st.textContent="未選擇降噪或放大，沒有需要處理的項目";return}
+    const t0=performance.now();
+    for(let i=0;i<passes.length;i++)c=await runPass(c,passes[i][0],passes[i][1],`處理中 (${i+1}/${passes.length})`);
+    if(scale===1.6)c=toCanvas(c,Math.round(W*1.6),Math.round(H*1.6));
+    const type=val("fmt"),blob=await new Promise(r=>c.toBlob(r,type,0.95));
+    if(outURL)URL.revokeObjectURL(outURL);
+    outURL=URL.createObjectURL(blob);
+    $("r").src=outURL;$("dl").style.display="inline-block";
+    $("dl").onclick=()=>{const a=document.createElement("a");a.href=outURL;a.download=`${name}_${c.width}x${c.height}.${type==="image/png"?"png":"webp"}`;a.click()};
+    st.textContent=`完成：${c.width}×${c.height}px，${(blob.size/1024).toFixed(0)} KB，耗時 ${((performance.now()-t0)/1000).toFixed(1)} 秒`;
+  }catch(e){st.textContent="處理失敗："+e.message}
+  finally{$("go").disabled=false;$("pg").style.display="none"}
+};
+</script>
+</body>
+</html>
